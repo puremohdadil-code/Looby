@@ -37,11 +37,25 @@ constexpr int kBtnClear = 203;
 constexpr int kBtnExit = 204;
 constexpr int kTimerUi = 301;
 
+enum class EventType : std::uint8_t {
+    Keyboard,
+    MouseMove,
+    MouseButton,
+    MouseWheel
+};
+
 struct MacroEvent {
     DWORD atMs{};
+    EventType type{EventType::Keyboard};
+
     DWORD vkCode{};
     DWORD scanCode{};
     DWORD keyFlags{};
+
+    LONG mouseDx{};
+    LONG mouseDy{};
+    DWORD mouseFlags{};
+    DWORD mouseData{};
 };
 
 HWND g_hwnd{};
@@ -51,6 +65,7 @@ HWND g_clearButton{};
 HWND g_exitButton{};
 
 HHOOK g_keyboardHook{};
+HHOOK g_mouseHook{};
 std::thread g_recordThread;
 std::thread g_playThread;
 
@@ -108,10 +123,45 @@ void PushEvent(const MacroEvent& event) {
     LeaveCriticalSection(&g_eventsLock);
 }
 
+void PushMouseMoveEvent(DWORD atMs, LONG dx, LONG dy) {
+    if (dx == 0 && dy == 0) {
+        return;
+    }
+
+    EnterCriticalSection(&g_eventsLock);
+
+    // Raw mice can report faster than the millisecond timer used by this app.
+    // Merge movement packets that land in the same millisecond so playback stays smooth
+    // without creating an unnecessarily huge recording.
+    if (!g_events.empty()) {
+        auto& last = g_events.back();
+        if (last.type == EventType::MouseMove && last.atMs == atMs) {
+            last.mouseDx += dx;
+            last.mouseDy += dy;
+            LeaveCriticalSection(&g_eventsLock);
+            return;
+        }
+    }
+
+    MacroEvent event{};
+    event.atMs = atMs;
+    event.type = EventType::MouseMove;
+    event.mouseDx = dx;
+    event.mouseDy = dy;
+    event.mouseFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE;
+    g_events.push_back(event);
+
+    LeaveCriticalSection(&g_eventsLock);
+}
+
 std::vector<MacroEvent> CopyEvents() {
     EnterCriticalSection(&g_eventsLock);
     auto copy = g_events;
     LeaveCriticalSection(&g_eventsLock);
+
+    std::stable_sort(copy.begin(), copy.end(), [](const MacroEvent& a, const MacroEvent& b) {
+        return a.atMs < b.atMs;
+    });
     return copy;
 }
 
@@ -146,6 +196,7 @@ LRESULT CALLBACK KeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
         if (!injected && !IsKeyboardHotkey(data->vkCode, keyDown)) {
             MacroEvent event{};
             event.atMs = ElapsedMs(g_recordStart);
+            event.type = EventType::Keyboard;
             event.vkCode = data->vkCode;
             event.scanCode = data->scanCode;
             event.keyFlags = data->flags;
@@ -154,6 +205,130 @@ LRESULT CALLBACK KeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
     }
 
     return CallNextHookEx(g_keyboardHook, code, wParam, lParam);
+}
+
+void PushMouseButtonEvent(DWORD atMs, DWORD flags, DWORD data = 0) {
+    MacroEvent event{};
+    event.atMs = atMs;
+    event.type = EventType::MouseButton;
+    event.mouseFlags = flags;
+    event.mouseData = data;
+    PushEvent(event);
+}
+
+void PushMouseWheelEvent(DWORD atMs, DWORD flags, LONG wheelDelta) {
+    MacroEvent event{};
+    event.atMs = atMs;
+    event.type = EventType::MouseWheel;
+    event.mouseFlags = flags;
+    event.mouseData = static_cast<DWORD>(wheelDelta);
+    PushEvent(event);
+}
+
+LRESULT CALLBACK MouseProc(int code, WPARAM wParam, LPARAM lParam) {
+    if (code == HC_ACTION && g_recording && !g_inPlayback) {
+        const auto* data = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
+        const bool injected = (data->flags & LLMHF_INJECTED) != 0;
+
+        if (!injected) {
+            const DWORD atMs = ElapsedMs(g_recordStart);
+
+            switch (wParam) {
+                case WM_LBUTTONDOWN:
+                    PushMouseButtonEvent(atMs, MOUSEEVENTF_LEFTDOWN);
+                    break;
+                case WM_LBUTTONUP:
+                    PushMouseButtonEvent(atMs, MOUSEEVENTF_LEFTUP);
+                    break;
+                case WM_RBUTTONDOWN:
+                    PushMouseButtonEvent(atMs, MOUSEEVENTF_RIGHTDOWN);
+                    break;
+                case WM_RBUTTONUP:
+                    PushMouseButtonEvent(atMs, MOUSEEVENTF_RIGHTUP);
+                    break;
+                case WM_MBUTTONDOWN:
+                    PushMouseButtonEvent(atMs, MOUSEEVENTF_MIDDLEDOWN);
+                    break;
+                case WM_MBUTTONUP:
+                    PushMouseButtonEvent(atMs, MOUSEEVENTF_MIDDLEUP);
+                    break;
+                case WM_XBUTTONDOWN:
+                    PushMouseButtonEvent(atMs, MOUSEEVENTF_XDOWN, HIWORD(data->mouseData));
+                    break;
+                case WM_XBUTTONUP:
+                    PushMouseButtonEvent(atMs, MOUSEEVENTF_XUP, HIWORD(data->mouseData));
+                    break;
+                case WM_MOUSEWHEEL:
+                    PushMouseWheelEvent(
+                        atMs, MOUSEEVENTF_WHEEL,
+                        static_cast<LONG>(static_cast<SHORT>(HIWORD(data->mouseData))));
+                    break;
+                case WM_MOUSEHWHEEL:
+                    PushMouseWheelEvent(
+                        atMs, MOUSEEVENTF_HWHEEL,
+                        static_cast<LONG>(static_cast<SHORT>(HIWORD(data->mouseData))));
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+
+    return CallNextHookEx(g_mouseHook, code, wParam, lParam);
+}
+
+bool RegisterRawMouseInput(HWND hwnd) {
+    RAWINPUTDEVICE device{};
+    device.usUsagePage = 0x01;  // Generic desktop controls
+    device.usUsage = 0x02;      // Mouse
+    device.dwFlags = RIDEV_INPUTSINK;
+    device.hwndTarget = hwnd;
+
+    return RegisterRawInputDevices(&device, 1, sizeof(device)) == TRUE;
+}
+
+void UnregisterRawMouseInput() {
+    RAWINPUTDEVICE device{};
+    device.usUsagePage = 0x01;
+    device.usUsage = 0x02;
+    device.dwFlags = RIDEV_REMOVE;
+    device.hwndTarget = nullptr;
+    RegisterRawInputDevices(&device, 1, sizeof(device));
+}
+
+void HandleRawMouseInput(LPARAM lParam) {
+    if (!g_recording || g_inPlayback) {
+        return;
+    }
+
+    UINT size = 0;
+    if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, nullptr, &size,
+                        sizeof(RAWINPUTHEADER)) != 0 ||
+        size == 0) {
+        return;
+    }
+
+    std::vector<BYTE> buffer(size);
+    const UINT bytesRead = GetRawInputData(
+        reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, buffer.data(), &size,
+        sizeof(RAWINPUTHEADER));
+
+    if (bytesRead == static_cast<UINT>(-1) || bytesRead != size) {
+        return;
+    }
+
+    const auto* raw = reinterpret_cast<const RAWINPUT*>(buffer.data());
+    if (raw->header.dwType != RIM_TYPEMOUSE) {
+        return;
+    }
+
+    const RAWMOUSE& mouse = raw->data.mouse;
+
+    // 3D games normally use relative raw mouse movement. Absolute packets are
+    // usually produced by tablets/touch devices, so they are intentionally skipped.
+    if ((mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0) {
+        PushMouseMoveEvent(ElapsedMs(g_recordStart), mouse.lLastX, mouse.lLastY);
+    }
 }
 
 void SendKeyEvent(const MacroEvent& event) {
@@ -171,6 +346,29 @@ void SendKeyEvent(const MacroEvent& event) {
     }
 
     SendInput(1, &input, sizeof(INPUT));
+}
+
+void SendMouseEvent(const MacroEvent& event) {
+    INPUT input{};
+    input.type = INPUT_MOUSE;
+    input.mi.dx = event.mouseDx;
+    input.mi.dy = event.mouseDy;
+    input.mi.mouseData = event.mouseData;
+    input.mi.dwFlags = event.mouseFlags;
+    SendInput(1, &input, sizeof(INPUT));
+}
+
+void SendMacroEvent(const MacroEvent& event) {
+    switch (event.type) {
+        case EventType::Keyboard:
+            SendKeyEvent(event);
+            break;
+        case EventType::MouseMove:
+        case EventType::MouseButton:
+        case EventType::MouseWheel:
+            SendMouseEvent(event);
+            break;
+    }
 }
 
 void WaitUntil(std::chrono::steady_clock::time_point deadline) {
@@ -227,7 +425,7 @@ void PlaybackThread() {
             }
 
             g_inPlayback = true;
-            SendKeyEvent(event);
+            SendMacroEvent(event);
             g_inPlayback = false;
         }
 
@@ -278,9 +476,9 @@ void RecordingThread() {
     }
 
     g_waitingToRecord = false;
-    g_recording = true;
     g_recordStart = std::chrono::steady_clock::now();
     g_modeStart = g_recordStart;
+    g_recording = true;
     SetStatus(L"Recording for 2 minutes");
 
     while (!g_stopRecording && ElapsedMs(g_recordStart) < kMaxRecordMs) {
@@ -326,13 +524,19 @@ void JoinFinishedThreads() {
 }
 
 void InstallHooks() {
-    g_keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardProc, GetModuleHandleW(nullptr), 0);
+    HINSTANCE module = GetModuleHandleW(nullptr);
+    g_keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardProc, module, 0);
+    g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, module, 0);
 }
 
 void RemoveHooks() {
     if (g_keyboardHook) {
         UnhookWindowsHookEx(g_keyboardHook);
         g_keyboardHook = nullptr;
+    }
+    if (g_mouseHook) {
+        UnhookWindowsHookEx(g_mouseHook);
+        g_mouseHook = nullptr;
     }
 }
 
@@ -408,7 +612,7 @@ void PaintUi(HWND hwnd) {
     }
 
     RECT help{24, 270, client.right - 24, 310};
-    DrawTextLine(dc, L"Tip: start recording, wait for the countdown, switch to your game, then use the keyboard once.", help, 16, kMuted);
+    DrawTextLine(dc, L"Tip: recording captures keyboard, mouse buttons, wheel, and raw relative movement for 3D camera input.", help, 16, kMuted);
 
     EndPaint(hwnd, &ps);
 }
@@ -444,6 +648,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             RegisterHotKey(hwnd, kHotkeyStopRecord, MOD_SHIFT | MOD_NOREPEAT, '2');
             SetTimer(hwnd, kTimerUi, 100, nullptr);
             InstallHooks();
+            if (!RegisterRawMouseInput(hwnd)) {
+                SetStatus(L"Raw mouse input could not be registered");
+            }
             return 0;
 
         case WM_COMMAND:
@@ -476,6 +683,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
 
+        case WM_INPUT:
+            HandleRawMouseInput(lParam);
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
+
         case WM_TIMER:
             JoinFinishedThreads();
             InvalidateRect(hwnd, nullptr, FALSE);
@@ -499,6 +710,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 g_playThread.join();
             }
             RemoveHooks();
+            UnregisterRawMouseInput();
             UnregisterHotKey(hwnd, kHotkeyPlayback);
             UnregisterHotKey(hwnd, kHotkeyRecord);
             UnregisterHotKey(hwnd, kHotkeyStopRecord);
