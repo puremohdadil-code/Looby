@@ -1,3 +1,4 @@
+// 7 time to start
 #ifndef UNICODE
 #define UNICODE
 #endif
