@@ -8,7 +8,6 @@ $outputExe = Join-Path $outputDir "LoopyMacro.exe"
 if (-not (Test-Path $compiler)) {
     throw "MinGW g++ was not found at $compiler"
 } 
-
 New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
 
 & $compiler `
