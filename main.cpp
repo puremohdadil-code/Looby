@@ -4,7 +4,7 @@
 #endif
 #ifndef _UNICODE
 #define _UNICODE
-#endif 
+#endif  
  
 #include <windows.h>
 #include <commctrl.h>
