@@ -1,6 +1,6 @@
 
 $ErrorActionPreference = "Stop"
-
+ 
 $compiler = "C:\msys64\mingw64\bin\g++.exe"
 $outputDir = Join-Path $PSScriptRoot "dist"
 $outputExe = Join-Path $outputDir "LoopyMacro.exe"
