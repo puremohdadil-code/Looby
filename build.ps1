@@ -1,4 +1,4 @@
-
+ 
 $ErrorActionPreference = "Stop"
   
 $compiler = "C:\msys64\mingw64\bin\g++.exe"
